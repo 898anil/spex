@@ -1,9 +1,8 @@
 """Graph builder - orchestrates scanning and inference to produce a Graph.
 
-All inference is generic: no hardcoded directory names, file prefixes, or
-domain-specific type/relationship mappings. The system learns types from
-frontmatter clustering and directory structure, and infers relationships
-from structural patterns (parent/child dirs, sibling files, cross-dir links).
+Inference is generic by default but can be guided by a spex.yaml config
+that provides type overrides (pattern-based), semantic relationship names,
+and custom ID patterns for cross-reference detection.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
+from spex.config import SpexConfig
 from spex.graph.model import Edge, Graph, Node
 from spex.scanner.parser import parse_file
 from spex.scanner.types import ParsedFile
@@ -295,19 +295,25 @@ def _resolve_link(source_path: str, target: str, root: Path) -> str | None:
         return None
 
 
-def build_graph(root: str | Path, extra_excludes: list[str] | None = None) -> Graph:
+def build_graph(
+    root: str | Path,
+    extra_excludes: list[str] | None = None,
+    config: SpexConfig | None = None,
+) -> Graph:
     """Build the complete document graph from a directory.
 
-    All inference is generic - no domain-specific hardcoding.
-    1. Walk and parse all markdown files
-    2. Infer types from frontmatter + directory structure
-    3. Build edges from inline links, frontmatter refs, and ID cross-refs
+    If config is provided, uses pattern-based type overrides, semantic
+    relationship names, and custom ID patterns from spex.yaml.
+    Otherwise falls back to generic inference.
     """
     root = Path(root).resolve()
     graph = Graph()
 
     # Step 1: Scan all files
-    paths = walk_markdown_files(root, extra_excludes)
+    excludes = extra_excludes or []
+    if config:
+        excludes = list(set(excludes + config.scan_excludes))
+    paths = walk_markdown_files(root, excludes or None)
     parsed_files: list[ParsedFile] = []
     for path in paths:
         try:
@@ -317,10 +323,17 @@ def build_graph(root: str | Path, extra_excludes: list[str] | None = None) -> Gr
             continue
 
     # Step 2: Infer types and create nodes
-    type_overrides = _cluster_types_by_frontmatter(parsed_files)
+    # Config type rules take priority, then frontmatter clustering, then generic inference
+    cluster_overrides = _cluster_types_by_frontmatter(parsed_files)
 
     for parsed in parsed_files:
-        doc_type = type_overrides.get(parsed.rel_path) or _infer_doc_type(parsed)
+        # Priority: config pattern > frontmatter cluster > generic inference
+        doc_type = None
+        if config:
+            doc_type = config.resolve_type(parsed.rel_path)
+        if not doc_type:
+            doc_type = cluster_overrides.get(parsed.rel_path) or _infer_doc_type(parsed)
+
         node = Node(
             path=parsed.rel_path,
             doc_type=doc_type,
@@ -335,10 +348,19 @@ def build_graph(root: str | Path, extra_excludes: list[str] | None = None) -> Gr
 
     # Step 3: Build edges from inline links
     for parsed in parsed_files:
+        src_node = graph.get_node(parsed.rel_path)
         for link in parsed.links:
             resolved = _resolve_link(parsed.rel_path, link.target, root)
             if resolved and resolved in graph:
-                relationship = _infer_relationship(parsed.rel_path, resolved)
+                tgt_node = graph.get_node(resolved)
+                # Try semantic relationship from config first
+                relationship = None
+                if config and src_node and tgt_node:
+                    relationship = config.get_relationship_name(
+                        src_node.doc_type, tgt_node.doc_type
+                    )
+                if not relationship:
+                    relationship = _infer_relationship(parsed.rel_path, resolved)
                 graph.add_edge(
                     Edge(
                         source=parsed.rel_path,
@@ -354,7 +376,6 @@ def build_graph(root: str | Path, extra_excludes: list[str] | None = None) -> Gr
         fm_refs = _extract_frontmatter_edges(parsed)
         for field_name, ref in fm_refs:
             candidates = [ref, ref + ".md", ref + "/INDEX.md", ref + "/README.md"]
-            # Also try relative to common roots
             for prefix in _guess_doc_roots(parsed_files):
                 if not ref.startswith(prefix):
                     candidates.extend([
@@ -382,8 +403,12 @@ def build_graph(root: str | Path, extra_excludes: list[str] | None = None) -> Gr
             if isinstance(file_id, str):
                 id_to_file[file_id] = parsed.rel_path
 
-    # Auto-detect ID patterns from the repo
-    id_patterns = _detect_id_patterns(parsed_files)
+    # Use config ID patterns if available, otherwise auto-detect
+    id_patterns = []
+    if config and config.id_patterns:
+        id_patterns = config.get_id_regex_patterns()
+    if not id_patterns:
+        id_patterns = _detect_id_patterns(parsed_files)
 
     if id_patterns:
         for parsed in parsed_files:

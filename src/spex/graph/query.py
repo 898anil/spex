@@ -5,9 +5,32 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-
+from spex.config import STRUCTURAL_RELATIONSHIPS
 from spex.graph.model import Edge, Graph, Node
 
+
+# ---------------------------------------------------------------------------
+# Edge filters
+# ---------------------------------------------------------------------------
+
+def _is_pipeline_edge(edge: Edge) -> bool:
+    """True if the edge represents a real pipeline dependency.
+
+    Pipeline edges have semantic relationship names assigned by config
+    (derives_to, satisfied_by, implemented_by, etc.). Structural edges
+    (links_to, related_to, indexed_by) are navigational noise.
+    """
+    return edge.relationship not in STRUCTURAL_RELATIONSHIPS
+
+
+def _is_any_edge(edge: Edge) -> bool:
+    """Accept all edges (original behavior)."""
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ImpactResult:
@@ -29,13 +52,21 @@ class ContextBundle:
     files: list[dict]
     file_count: int
     estimated_tokens: int
+    token_budget: int | None = None
+    truncated: bool = False
+    excluded_count: int = 0
 
+
+# ---------------------------------------------------------------------------
+# Impact analysis
+# ---------------------------------------------------------------------------
 
 def impact(
     graph: Graph,
     target: str,
     depth: int = 2,
     direction: str = "both",
+    pipeline_only: bool = False,
 ) -> ImpactResult:
     """Compute the cascade of files affected by changing target.
 
@@ -44,8 +75,14 @@ def impact(
         target: Repo-relative path to the changed file
         depth: Maximum traversal depth (1-10)
         direction: "downstream", "upstream", or "both"
+        pipeline_only: If True, only follow pipeline edges (semantic
+            relationships like derives_to, satisfied_by). Skips generic
+            links_to, related_to, indexed_by edges. This dramatically
+            reduces noise and gives focused results for AI agents.
     """
     depth = max(1, min(depth, 10))
+    edge_filter = _is_pipeline_edge if pipeline_only else _is_any_edge
+
     node = graph.get_node(target)
     if not node:
         return ImpactResult(
@@ -56,20 +93,21 @@ def impact(
     visited: set[str] = {target}
     cascade: list[dict] = []
 
-    queue: deque[tuple[str, int, str]] = deque()
+    # Queue entries: (path, depth, direction_label, relationship_that_led_here)
+    queue: deque[tuple[str, int, str, str]] = deque()
 
     if direction in ("downstream", "both"):
         for edge in graph.outgoing(target):
-            if edge.target not in visited:
-                queue.append((edge.target, 1, "downstream"))
+            if edge.target not in visited and edge_filter(edge):
+                queue.append((edge.target, 1, "downstream", edge.relationship))
 
     if direction in ("upstream", "both"):
         for edge in graph.incoming(target):
-            if edge.source not in visited:
-                queue.append((edge.source, 1, "upstream"))
+            if edge.source not in visited and edge_filter(edge):
+                queue.append((edge.source, 1, "upstream", edge.relationship))
 
     while queue:
-        path, current_depth, dir_label = queue.popleft()
+        path, current_depth, dir_label, rel = queue.popleft()
         if current_depth > depth or path in visited:
             continue
         visited.add(path)
@@ -78,23 +116,10 @@ def impact(
         if not n:
             continue
 
-        # Find the edge that brought us here
-        relationship = "links_to"
-        if dir_label == "downstream":
-            for e in graph.outgoing(target if current_depth == 1 else path):
-                if e.target == path:
-                    relationship = e.relationship
-                    break
-        else:
-            for e in graph.incoming(target if current_depth == 1 else path):
-                if e.source == path:
-                    relationship = e.relationship
-                    break
-
         cascade.append({
             "path": path,
             "type": n.doc_type,
-            "relationship": relationship,
+            "relationship": rel,
             "direction": dir_label,
             "depth": current_depth,
         })
@@ -102,12 +127,12 @@ def impact(
         if current_depth < depth:
             if dir_label == "downstream":
                 for edge in graph.outgoing(path):
-                    if edge.target not in visited:
-                        queue.append((edge.target, current_depth + 1, "downstream"))
+                    if edge.target not in visited and edge_filter(edge):
+                        queue.append((edge.target, current_depth + 1, "downstream", edge.relationship))
             else:
                 for edge in graph.incoming(path):
-                    if edge.source not in visited:
-                        queue.append((edge.source, current_depth + 1, "upstream"))
+                    if edge.source not in visited and edge_filter(edge):
+                        queue.append((edge.source, current_depth + 1, "upstream", edge.relationship))
 
     cascade.sort(key=lambda x: (0 if x["direction"] == "downstream" else 1, x["depth"]))
 
@@ -121,73 +146,113 @@ def impact(
     )
 
 
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+
 def context_bundle(
     graph: Graph,
     target: str,
     root: Path,
     depth: int = 2,
     include_content: bool = True,
+    token_budget: int | None = None,
+    pipeline_only: bool = False,
 ) -> ContextBundle:
     """Assemble a context bundle for AI consumption.
 
     Returns upstream context, the target file, and downstream files
-    in dependency order.
+    in dependency order. When pipeline_only=True, only includes files
+    connected via semantic pipeline edges (not generic links).
+
+    Args:
+        token_budget: Max tokens to include. Files are added in priority
+            order (target first, then depth-1 pipeline, then depth-2, etc.)
+            and stops when budget would be exceeded. None = unlimited.
+        pipeline_only: Only follow pipeline edges for focused context.
     """
-    # Get upstream and downstream
-    impact_result = impact(graph, target, depth=depth, direction="both")
+    impact_result = impact(
+        graph, target, depth=depth, direction="both",
+        pipeline_only=pipeline_only,
+    )
+
+    # Prioritize files: target, then by depth (shallow first), then upstream before downstream
+    upstream = [c for c in impact_result.cascade if c["direction"] == "upstream"]
+    downstream = [c for c in impact_result.cascade if c["direction"] == "downstream"]
+
+    # Sort each group by depth (nearest first)
+    upstream.sort(key=lambda x: x["depth"])
+    downstream.sort(key=lambda x: x["depth"])
 
     files: list[dict] = []
+    tokens_used = 0
+    excluded = 0
 
-    # Upstream files first (context)
-    upstream = [c for c in impact_result.cascade if c["direction"] == "upstream"]
+    def _add_file(entry: dict, content: str | None) -> bool:
+        """Add a file to the bundle, respecting token budget. Returns False if budget exceeded."""
+        nonlocal tokens_used, excluded
+        if content is not None:
+            entry["content"] = content
+            entry["content_length"] = len(content)
+            file_tokens = len(content) // 4
+        else:
+            file_tokens = 0
+
+        if token_budget is not None and tokens_used + file_tokens > token_budget and files:
+            # Budget exceeded, skip this file (but always include first file)
+            excluded += 1
+            return False
+
+        tokens_used += file_tokens
+        files.append(entry)
+        return True
+
+    def _read_file(path: str) -> str | None:
+        if not include_content:
+            return None
+        file_path = root / path
+        if file_path.exists():
+            return file_path.read_text(encoding="utf-8", errors="replace")
+        return None
+
+    # 1. Target file (always included)
+    target_entry: dict = {
+        "path": target,
+        "role": "target",
+        "type": impact_result.target_type,
+    }
+    _add_file(target_entry, _read_file(target))
+
+    # 2. Upstream files (context the target depends on)
     for item in upstream:
         entry: dict = {
             "path": item["path"],
             "role": "upstream",
             "type": item["type"],
             "relationship": item["relationship"],
+            "depth": item["depth"],
         }
-        if include_content:
-            file_path = root / item["path"]
-            if file_path.exists():
-                entry["content"] = file_path.read_text(encoding="utf-8", errors="replace")
-                entry["content_length"] = len(entry["content"])
-        files.append(entry)
+        if not _add_file(entry, _read_file(item["path"])):
+            break  # budget exceeded, stop adding
 
-    # Target file
-    target_entry: dict = {
-        "path": target,
-        "role": "target",
-        "type": impact_result.target_type,
-    }
-    if include_content:
-        target_path = root / target
-        if target_path.exists():
-            target_entry["content"] = target_path.read_text(encoding="utf-8", errors="replace")
-            target_entry["content_length"] = len(target_entry["content"])
-    files.append(target_entry)
-
-    # Downstream files
-    downstream = [c for c in impact_result.cascade if c["direction"] == "downstream"]
+    # 3. Downstream files (files that need updating)
     for item in downstream:
         entry = {
             "path": item["path"],
             "role": "downstream",
             "type": item["type"],
             "relationship": item["relationship"],
+            "depth": item["depth"],
         }
-        if include_content:
-            file_path = root / item["path"]
-            if file_path.exists():
-                entry["content"] = file_path.read_text(encoding="utf-8", errors="replace")
-                entry["content_length"] = len(entry["content"])
-        files.append(entry)
-
-    total_chars = sum(f.get("content_length", 0) for f in files)
+        if not _add_file(entry, _read_file(item["path"])):
+            break  # budget exceeded
 
     return ContextBundle(
         target=target,
         files=files,
         file_count=len(files),
-        estimated_tokens=total_chars // 4,
+        estimated_tokens=tokens_used,
+        token_budget=token_budget,
+        truncated=excluded > 0,
+        excluded_count=excluded,
     )

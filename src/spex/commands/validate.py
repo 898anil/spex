@@ -48,23 +48,39 @@ def _check_orphans(graph: Graph) -> list[dict]:
 
 
 def _check_circular(graph: Graph) -> list[dict]:
-    """Detect circular dependency chains."""
+    """Detect circular dependency chains.
+
+    Only follows pipeline edges (semantic relationships like derives_to,
+    satisfied_by, implemented_by). Skips structural/navigational edges
+    (links_to, related_to, indexed_by) which create noise from bidirectional
+    links and INDEX cross-references that are normal in documentation repos.
+    """
+    from spex.config import STRUCTURAL_RELATIONSHIPS
+
     issues = []
     visited: set[str] = set()
     rec_stack: set[str] = set()
     cycles: list[list[str]] = []
 
+    # Build filtered adjacency: only pipeline edges
+    pipeline_outgoing: dict[str, list[tuple[str, str]]] = {}
+    for edge in graph.edges:
+        if edge.relationship not in STRUCTURAL_RELATIONSHIPS:
+            pipeline_outgoing.setdefault(edge.source, []).append(
+                (edge.target, edge.relationship)
+            )
+
     def _dfs(path: str, chain: list[str]) -> None:
         visited.add(path)
         rec_stack.add(path)
         chain.append(path)
-        for edge in graph.outgoing(path):
-            if edge.target in rec_stack:
-                cycle_start = chain.index(edge.target)
-                cycle = chain[cycle_start:] + [edge.target]
+        for target, _rel in pipeline_outgoing.get(path, []):
+            if target in rec_stack:
+                cycle_start = chain.index(target)
+                cycle = chain[cycle_start:] + [target]
                 cycles.append(cycle)
-            elif edge.target not in visited:
-                _dfs(edge.target, chain)
+            elif target not in visited:
+                _dfs(target, chain)
         chain.pop()
         rec_stack.discard(path)
 
@@ -74,6 +90,12 @@ def _check_circular(graph: Graph) -> list[dict]:
 
     seen_cycles: set[tuple[str, ...]] = set()
     for cycle in cycles:
+        # Skip 2-node cycles (bidirectional relationships, not real circular deps)
+        # e.g., domain-spec → tech-spec and tech-spec → domain-spec
+        unique_nodes = set(cycle[:-1])
+        if len(unique_nodes) <= 2:
+            continue
+
         normalized = tuple(sorted(cycle[:-1]))
         if normalized not in seen_cycles:
             seen_cycles.add(normalized)
@@ -150,21 +172,162 @@ def _check_frontmatter(graph: Graph) -> list[dict]:
     return issues
 
 
+def _check_required_sections(graph: Graph, root: Path) -> list[dict]:
+    """Check that documents have required sections (from config type_rules or doc_specs)."""
+    from spex.config import load_config
+
+    config = load_config(root)
+    issues = []
+
+    # Build section requirements from type_rules and doc_specs
+    section_reqs: dict[str, list[str]] = {}
+    for rule in config.type_rules:
+        if rule.required_sections:
+            section_reqs[rule.type] = rule.required_sections
+    for spec in config.doc_specs:
+        if spec.required_sections:
+            section_reqs[spec.type] = spec.required_sections
+
+    if not section_reqs:
+        return issues
+
+    for node in graph:
+        required = section_reqs.get(node.doc_type)
+        if not required:
+            continue
+
+        file_path = root / node.path
+        if not file_path.exists():
+            continue
+
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        for section in required:
+            # Check for the heading text (allowing for trailing content)
+            if section not in content:
+                issues.append({
+                    "check": "sections",
+                    "severity": "warning",
+                    "file": node.path,
+                    "message": f"Missing required section '{section}' for type '{node.doc_type}'",
+                })
+
+    return issues
+
+
+def _check_chains(graph: Graph) -> list[dict]:
+    """Check requirement chain completeness (from config chain rules)."""
+    from spex.config import load_config
+
+    config = load_config(Path(".").resolve())
+    issues = []
+
+    for chain in config.chains:
+        anchor_nodes = graph.nodes_of_type(chain.anchor_type)
+        if not anchor_nodes:
+            continue
+
+        for anchor in anchor_nodes:
+            if chain.match_by == "directory":
+                anchor_dir = str(Path(anchor.path).parent)
+                for required_type in chain.required_chain:
+                    found = any(
+                        n.doc_type == required_type
+                        and str(Path(n.path).parent) == anchor_dir
+                        for n in graph
+                    )
+                    if not found:
+                        issues.append({
+                            "check": "chains",
+                            "severity": chain.severity,
+                            "file": anchor.path,
+                            "message": (
+                                f"Chain '{chain.name}': missing '{required_type}' "
+                                f"co-located with '{anchor.doc_type}'"
+                            ),
+                        })
+            elif chain.match_by == "feature_id":
+                # Match by feature number extracted from path
+                import re
+
+                m = re.search(r"/(\d{2})-", anchor.path)
+                if not m:
+                    continue
+                feature_num = m.group(1)
+                for required_type in chain.required_chain:
+                    found = any(
+                        n.doc_type == required_type and f"/{feature_num}-" in n.path
+                        for n in graph
+                    )
+                    if not found:
+                        issues.append({
+                            "check": "chains",
+                            "severity": chain.severity,
+                            "file": anchor.path,
+                            "message": (
+                                f"Chain '{chain.name}': no '{required_type}' found "
+                                f"for feature {feature_num}"
+                            ),
+                        })
+
+    return issues
+
+
+def _check_must_reference(graph: Graph) -> list[dict]:
+    """Check that documents reference required types (from config doc_specs.must_reference)."""
+    from spex.config import load_config
+
+    config = load_config(Path(".").resolve())
+    issues = []
+
+    for spec in config.doc_specs:
+        if not spec.must_reference:
+            continue
+
+        nodes = graph.nodes_of_type(spec.type)
+        for node in nodes:
+            outgoing = graph.outgoing(node.path)
+            referenced_types = set()
+            for edge in outgoing:
+                target_node = graph.get_node(edge.target)
+                if target_node:
+                    referenced_types.add(target_node.doc_type)
+
+            for req_type in spec.must_reference:
+                if req_type not in referenced_types:
+                    issues.append({
+                        "check": "must_reference",
+                        "severity": "warning",
+                        "file": node.path,
+                        "message": (
+                            f"Type '{spec.type}' should reference '{req_type}' "
+                            f"but no outgoing link found"
+                        ),
+                    })
+
+    return issues
+
+
 ALL_CHECKS = {
     "links": _check_broken_links,
     "orphans": _check_orphans,
     "circular": _check_circular,
     "indexes": _check_indexes,
     "schema": _check_frontmatter,
+    "sections": _check_required_sections,
+    "chains": _check_chains,
+    "must_reference": _check_must_reference,
 }
 
 # Checks that need root path vs graph-only
-_NEEDS_ROOT = {"links", "indexes"}
+_NEEDS_ROOT = {"links", "indexes", "sections"}
 
 
 def run(checks: list[str] | None = None, as_json: bool = False) -> None:
+    from spex.config import load_config
+
     root = Path(".").resolve()
-    graph = build_graph(root)
+    config = load_config(root)
+    graph = build_graph(root, config=config)
 
     selected = checks or list(ALL_CHECKS.keys())
     all_issues: list[dict] = []

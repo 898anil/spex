@@ -15,9 +15,19 @@ def run(
     depth: int = 2,
     direction: str = "both",
     as_json: bool = False,
+    pipeline_only: bool = False,
 ) -> None:
-    graph = build_graph(".")
-    result = impact(graph, file_path, depth=depth, direction=direction)
+    from pathlib import Path
+
+    from spex.config import load_config
+
+    root = Path(".").resolve()
+    config = load_config(root)
+    graph = build_graph(root, config=config)
+    result = impact(
+        graph, file_path, depth=depth, direction=direction,
+        pipeline_only=pipeline_only,
+    )
 
     if not result.cascade and result.target_type == "unknown":
         click.echo(f"File not found in graph: {file_path}", err=True)
@@ -28,6 +38,7 @@ def run(
         output = {
             "target": result.target,
             "type": result.target_type,
+            "pipeline_only": pipeline_only,
             "cascade": result.cascade,
             "total_affected": result.total_affected,
             "downstream_count": result.downstream_count,
@@ -36,7 +47,8 @@ def run(
         click.echo(json.dumps(output, indent=2))
         return
 
-    click.echo(f"Impact analysis for: {result.target}")
+    mode_label = " (pipeline only)" if pipeline_only else ""
+    click.echo(f"Impact analysis for: {result.target}{mode_label}")
     click.echo(f"Type: {result.target_type}\n")
 
     downstream = [c for c in result.cascade if c["direction"] == "downstream"]

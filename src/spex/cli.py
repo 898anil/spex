@@ -33,15 +33,16 @@ def scan(path: str, as_json: bool, verbose: bool) -> None:
 @click.option("--downstream", is_flag=True, help="Only show downstream impact.")
 @click.option("--upstream", is_flag=True, help="Only show upstream impact.")
 @click.option("--depth", default=2, help="Traversal depth (default: 2).")
+@click.option("--pipeline", is_flag=True, help="Only follow pipeline edges (semantic relationships).")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 def impact(
-    file_path: str, downstream: bool, upstream: bool, depth: int, as_json: bool
+    file_path: str, downstream: bool, upstream: bool, depth: int, pipeline: bool, as_json: bool
 ) -> None:
     """Show what files are affected by changing a file."""
     from spex.commands.impact import run
 
     direction = "downstream" if downstream else ("upstream" if upstream else "both")
-    run(file_path, depth=depth, direction=direction, as_json=as_json)
+    run(file_path, depth=depth, direction=direction, as_json=as_json, pipeline_only=pipeline)
 
 
 @main.command()
@@ -50,13 +51,19 @@ def impact(
 @click.option("--output", "-o", type=click.Path(), help="Write to file.")
 @click.option("--tokens", is_flag=True, help="Show token estimate only.")
 @click.option("--no-content", is_flag=True, help="Metadata only.")
+@click.option("--budget", type=int, default=None, help="Max tokens to include (e.g., 50000).")
+@click.option("--pipeline", is_flag=True, help="Only follow pipeline edges (focused context).")
 def context(
-    file_path: str, depth: int, output: str | None, tokens: bool, no_content: bool
+    file_path: str, depth: int, output: str | None, tokens: bool, no_content: bool,
+    budget: int | None, pipeline: bool,
 ) -> None:
     """Assemble a context bundle for AI consumption."""
     from spex.commands.context import run
 
-    run(file_path, depth=depth, output=output, tokens_only=tokens, no_content=no_content)
+    run(
+        file_path, depth=depth, output=output, tokens_only=tokens,
+        no_content=no_content, token_budget=budget, pipeline_only=pipeline,
+    )
 
 
 @main.command()
@@ -66,6 +73,9 @@ def context(
 @click.option("--orphans", is_flag=True, help="Only check orphaned files.")
 @click.option("--indexes", is_flag=True, help="Only check INDEX.md consistency.")
 @click.option("--circular", is_flag=True, help="Only check circular dependencies.")
+@click.option("--sections", is_flag=True, help="Only check required sections.")
+@click.option("--chains", is_flag=True, help="Only check requirement chain completeness.")
+@click.option("--must-reference", is_flag=True, help="Only check required cross-references.")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 def validate(
     links: bool,
@@ -74,6 +84,9 @@ def validate(
     orphans: bool,
     indexes: bool,
     circular: bool,
+    sections: bool,
+    chains: bool,
+    must_reference: bool,
     as_json: bool,
 ) -> None:
     """Run validation checks on the documentation repo."""
@@ -92,6 +105,12 @@ def validate(
         checks.append("indexes")
     if circular:
         checks.append("circular")
+    if sections:
+        checks.append("sections")
+    if chains:
+        checks.append("chains")
+    if must_reference:
+        checks.append("must_reference")
     run(checks=checks or None, as_json=as_json)
 
 

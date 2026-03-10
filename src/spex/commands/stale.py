@@ -12,8 +12,11 @@ from spex.graph.builder import build_graph
 
 
 def run(days: int = 14, file_type: str | None = None, as_json: bool = False) -> None:
+    from spex.config import load_config
+
     root = Path(".").resolve()
-    graph = build_graph(root)
+    config = load_config(root)
+    graph = build_graph(root, config=config)
     now = time.time()
     threshold_seconds = days * 86400
 

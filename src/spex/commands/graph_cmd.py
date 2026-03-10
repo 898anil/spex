@@ -17,8 +17,11 @@ def run(
     depth: int = 1,
     as_json: bool = False,
 ) -> None:
+    from spex.config import load_config
+
     root = Path(".").resolve()
-    graph = build_graph(root)
+    config = load_config(root)
+    graph = build_graph(root, config=config)
 
     if stats or (not file_path and not file_type):
         _show_stats(graph, as_json)

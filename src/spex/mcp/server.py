@@ -26,8 +26,11 @@ _root: Path | None = None
 def _ensure_graph() -> tuple[Graph, Path]:
     global _graph, _root
     if _graph is None:
+        from spex.config import load_config
+
         _root = Path(".").resolve()
-        _graph = build_graph(_root)
+        config = load_config(_root)
+        _graph = build_graph(_root, config=config)
         print(
             f"spex: graph built ({len(_graph)} nodes, {len(_graph.edges)} edges)",
             file=sys.stderr,

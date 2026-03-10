@@ -15,7 +15,9 @@ TOOLS = [
             "Given a file path that was changed, returns all upstream and downstream "
             "files affected by the change with recursive depth traversal. Use this "
             "FIRST when any documentation file is modified to know exactly which "
-            "other files need updating."
+            "other files need updating. Use pipeline_only=true for focused results "
+            "that only follow semantic dependency edges (derives_to, satisfied_by, "
+            "implemented_by) instead of all links."
         ),
         "inputSchema": {
             "type": "object",
@@ -35,6 +37,16 @@ TOOLS = [
                     "description": "Which direction to traverse.",
                     "default": "both",
                 },
+                "pipeline_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Only follow pipeline edges (semantic relationships like "
+                        "derives_to, satisfied_by). Dramatically reduces noise. "
+                        "Default false for backwards compatibility, but true is "
+                        "recommended for AI context assembly."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["file_path"],
         },
@@ -44,7 +56,8 @@ TOOLS = [
         "description": (
             "Returns file contents for a changed file and all affected files. "
             "Use AFTER get_change_impact to get the actual content you need to "
-            "read and update."
+            "read and update. Supports token budgets to avoid context window "
+            "overflow, and pipeline_only mode for focused context."
         ),
         "inputSchema": {
             "type": "object",
@@ -62,6 +75,22 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Whether to include file contents (default true).",
                     "default": True,
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": (
+                        "Maximum tokens to include. Files are added in priority "
+                        "order (target first, then nearest dependencies) and stops "
+                        "when budget is reached. Omit for unlimited."
+                    ),
+                },
+                "pipeline_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Only include files connected via pipeline edges "
+                        "(semantic relationships). Recommended for AI agents."
+                    ),
+                    "default": False,
                 },
             },
             "required": ["file_path"],
@@ -185,10 +214,12 @@ def handle_tool_call(
             arguments["file_path"],
             depth=arguments.get("depth", 2),
             direction=arguments.get("direction", "both"),
+            pipeline_only=arguments.get("pipeline_only", False),
         )
         return json.dumps({
             "target": result.target,
             "type": result.target_type,
+            "pipeline_only": arguments.get("pipeline_only", False),
             "cascade": result.cascade,
             "total_affected": result.total_affected,
             "downstream_count": result.downstream_count,
@@ -202,16 +233,27 @@ def handle_tool_call(
             root,
             depth=arguments.get("depth", 2),
             include_content=arguments.get("include_content", True),
+            token_budget=arguments.get("token_budget"),
+            pipeline_only=arguments.get("pipeline_only", False),
         )
-        return json.dumps({
+        result_data = {
             "target": bundle.target,
             "files": bundle.files,
             "file_count": bundle.file_count,
             "estimated_tokens": bundle.estimated_tokens,
-        }, indent=2)
+        }
+        if bundle.token_budget is not None:
+            result_data["token_budget"] = bundle.token_budget
+            result_data["truncated"] = bundle.truncated
+            result_data["excluded_count"] = bundle.excluded_count
+        return json.dumps(result_data, indent=2)
 
     if name == "get_propagation_steps":
-        result = impact(graph, arguments["file_path"], depth=3, direction="downstream")
+        # Use pipeline_only=True for focused propagation (only real dependencies)
+        result = impact(
+            graph, arguments["file_path"], depth=3, direction="downstream",
+            pipeline_only=True,
+        )
         steps = [f"1. You changed: {result.target} ({result.target_type})"]
         n = 2
         for item in result.cascade:

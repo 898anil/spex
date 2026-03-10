@@ -71,8 +71,11 @@ def _generate_index(graph: Graph, root: Path, directory: str, dry_run: bool) -> 
 
 
 def run(indexes: bool = False, dashboard: bool = False, dry_run: bool = False) -> None:
+    from spex.config import load_config
+
     root = Path(".").resolve()
-    graph = build_graph(root)
+    config = load_config(root)
+    graph = build_graph(root, config=config)
 
     if dashboard and not indexes:
         click.echo("Dashboard generation not yet implemented")

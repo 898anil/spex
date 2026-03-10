@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import click
 
+from spex.config import load_config
 from spex.graph.builder import build_graph
 
 
 def run(path: str, as_json: bool = False, verbose: bool = False) -> None:
     start = time.monotonic()
-    graph = build_graph(path)
+    root = Path(path).resolve()
+    config = load_config(root)
+    graph = build_graph(root, config=config)
     elapsed = time.monotonic() - start
 
     types = graph.all_types()
